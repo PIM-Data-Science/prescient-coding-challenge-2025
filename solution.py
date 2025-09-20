@@ -8,12 +8,25 @@ import nbformat
 from scipy.optimize import minimize
 import plotly.express as px
 
+
+from sklearn.decomposition import PCA
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error
+from sklearn.linear_model import Lasso, ElasticNet, LinearRegression, BayesianRidge
+import warnings
+warnings.filterwarnings('ignore')
+
+
 print('---> Python Script Start', t0 := datetime.datetime.now())
 
 # %%
 
 print('---> initial data set up')
-nwankcqmeklngfop
+
 # instrument data
 df_bonds = pd.read_csv('data/data_bonds.csv')
 df_bonds['datestamp'] = pd.to_datetime(df_bonds['datestamp']).apply(lambda d: d.date())
@@ -60,10 +73,35 @@ for i in range(len(df_signals)):
 
     print('---> doing', df_signals.loc[i, 'datestamp'])    
 
+    # Data preprocessing:
+    bond_names = np.array([
+        'Constant Term Maturity Bond 3 Months',
+        'Constant Term Maturity Bond 2 Year',
+        'Constant Term Maturity Bond 4 Year',
+        'Constant Term Maturity Bond 5 Year',
+        'Constant Term Maturity Bond 7 Year',
+        'Constant Term Maturity Bond 10 Year',
+        'Constant Term Maturity Bond 12 Year',
+        'Constant Term Maturity Bond 15 Year',
+        'Constant Term Maturity Bond 20 Year',
+        'Constant Term Maturity Bond 30 Year'
+    ])
+    durations = {0.25, 2, 4, 5, 7, 10, 12, 15, 20, 30}
+    # Create mapping dictionary
+    bond_map = dict(zip(bond_names, durations))
+
+    # Map bond names to numeric duration
+    df_bonds['duration'] = df_bonds['bond_name'].map(bond_map)
+ 
+
+
     # this iterations training set
     df_train_bonds = df_bonds[df_bonds['datestamp']<df_signals.loc[i, 'datestamp']].copy()
     df_train_albi = df_albi[df_albi['datestamp']<df_signals.loc[i, 'datestamp']].copy()
     df_train_macro = df_macro[df_macro['datestamp']<df_signals.loc[i, 'datestamp']].copy()
+
+    df_train_bonds['yield_t_1'] = df_train_bonds['yield'].shift(1) 
+    df_train_bonds['yield_t']= df_train_albi['yield'].shift(1)
 
     # this iterations test set
     df_test_bonds = df_bonds[df_bonds['datestamp']>=df_signals.loc[i, 'datestamp']].copy()
@@ -79,6 +117,122 @@ for i in range(len(df_signals)):
     df_train_bonds['signal'] = df_train_bonds['md_per_conv']*100 - df_train_bonds['top40_return']/10 + df_train_bonds['comdty_fut']/100
     df_train_bonds_current = df_train_bonds[df_train_bonds['datestamp'] == df_train_bonds['datestamp'].max()]
     
+    # want to see the min and max of signal
+    # print(f"----> signal min {df_train_bonds_current['signal'].min():.4f} max {df_train_bonds_current['signal'].max():.4f}")
+    
+    # start creating my own signal----------------------------------------------------------------------------------------------------
+    df_all = df_train_macro.merge(df_train_bonds, how='left', on = 'datestamp')
+    df_all = df_all.select_dtypes(include=[np.number]).dropna()
+    pca = PCA()
+    pca.fit(df_all)
+
+    # Get explained variance ratio
+    explained_var = pca.explained_variance_ratio_
+
+    # Get loadings (bond weights on each PC)
+    n_components = df_all.shape[1] 
+
+    loadings = pd.DataFrame(
+        pca.components_.T,
+        index=df_all.columns,
+        columns=[f"PC{i+1}" for i in range(n_components)]
+    )
+
+    # Get principal component scores (time series of hidden factors)
+    scores = pd.DataFrame(
+        pca.transform(df_all),
+        columns=[f"PC{i+1}" for i in range(n_components)],
+        index=df_all.index
+    )
+
+
+# FAST ML PIPELINE TO PREDICT mod_signal -------------------------------------------------------
+    
+# Simple feature selection - only use immediately available features
+    simple_features = ['modified_duration', 'convexity', 'us_10y', 'us_2y', 'steepness', 'md_per_conv', 'duration', 'top40_return', 'comdty_fut', 'yield_t', 'yield_t_1']
+    
+    # Add first few PCA components as features
+    pca_features = [f'PC{j+1}' for j in range(min(5, n_components))]  # Only first 3 for speed
+    
+    # Filter available features
+    available_features = [col for col in simple_features if col in df_train_bonds.columns]
+    
+    # Quick linear model - no cross validation for speed
+    if len(available_features) >= 3 and len(df_train_bonds) > 20:
+        # Create target (next period return)
+        df_ml = df_train_bonds.copy()
+        df_ml['target'] = df_ml.groupby('bond_code')['return'].shift(-1)
+        
+        # Add PCA components to training data
+        if len(scores) > 0:
+            for pca_feat in pca_features:
+                if pca_feat in scores.columns:
+                    # Map PCA scores to bond data by index
+                    df_ml = df_ml.merge(scores[[pca_feat]], left_index=True, right_index=True, how='left')
+                    if pca_feat in df_ml.columns:
+                        available_features.append(pca_feat)
+        
+        df_ml_clean = df_ml[available_features + ['target']].dropna()
+        
+        if len(df_ml_clean) > 10:
+            X = df_ml_clean[available_features].values
+            y = df_ml_clean['target'].values
+            
+            # Simple Ridge regression - fast
+
+
+            # # L1 regularization - good for feature selection
+            # model = Lasso(alpha=0.1)
+
+            # # Combines L1 and L2 regularization
+            # model = ElasticNet(alpha=0.1, l1_ratio=0.5)
+
+            # # Bayesian approach with uncertainty estimates
+            model = BayesianRidge()
+
+            # # Plain linear regression
+            # model = LinearRegression()
+            # model = Ridge(alpha=0.1)
+            model.fit(X, y)
+            
+            # Prepare current data with PCA features
+            df_current = df_train_bonds_current.copy()
+            
+            # Add PCA components for current prediction
+            if len(scores) > 0:
+                latest_scores = scores.iloc[-1]  # Get latest PCA scores
+                for pca_feat in pca_features:
+                    if pca_feat in latest_scores.index:
+                        df_current[pca_feat] = latest_scores[pca_feat]
+            
+            # Get final available features for prediction
+            current_available = [col for col in available_features if col in df_current.columns]
+            
+            # Predict for current bonds
+            current_X = df_current[current_available].fillna(0).values
+            df_train_bonds_current = df_current.copy()
+            df_train_bonds_current['mod_signal'] = model.predict(current_X)
+            
+            # print(f"----> Fast ML+PCA mod_signal range: {df_train_bonds_current['mod_signal'].min():.4f} to {df_train_bonds_current['mod_signal'].max():.4f}")
+        else:
+            df_train_bonds_current['mod_signal'] = df_train_bonds_current['return'].fillna(0)
+            # print(f"----> Insufficient data for ML, fallback mod_signal range: {df_train_bonds_current['mod_signal'].min():.4f} to {df_train_bonds_current['mod_signal'].max():.4f}")   
+    else:
+        # Fallback: use simple signal transformation
+        df_train_bonds_current['mod_signal'] = df_train_bonds_current['signal'] * 0.01
+        # print(f"----> Fallback mod_signal range: {df_train_bonds_current['mod_signal'].min():.4f} to {df_train_bonds_current['mod_signal'].max():.4f}")
+    
+    # END ML PIPELINE -----------------------------------------------------------------------------------
+
+    # Create df_train['mod_signal'] from features with some ML algo. Target feature is time of yield+1
+    # df_train_bonds['signal'] = explained_var[0]*scores['PC1'] + scores['PC1'] * scores['PC2'] + explained_var[1]*scores['PC2']
+    # df_train_bonds['signal'] = df_train_bonds_current['mod_signal'] - df_train_bonds['modified_duration'] + 0.5*df_train_bonds_current['mod_signal']**2 * df_train_bonds['convexity']
+    df_train_bonds['signal'] = df_train_bonds_current['mod_signal']
+
+    df_train_bonds_current = df_train_bonds[df_train_bonds['datestamp'] == df_train_bonds['datestamp'].max()]
+    
+
+    #-----------------------------------------The weight optimization-----------------------------------------#
     # optimisation objective
     def objective(weights, signal, prev_weights, turnover_lambda=0.1):
         turnover = np.sum(np.abs(weights - prev_weights))
@@ -108,7 +262,7 @@ for i in range(len(df_signals)):
 
     prev_weights = optimal_weights
 # %%
-
+# Don't change anytthing from here onwards
 def plot_payoff(weight_matrix):
 
     # check weights sum to one
