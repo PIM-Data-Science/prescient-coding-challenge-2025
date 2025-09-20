@@ -44,11 +44,13 @@ df_signals <- df_bonds %>%
 
 
 # parameters for optimisation - in this sample solution we use a momentum lookback strategy
-n_days <- 10
+n_days <- 100
 prev_weights <- rep(0.1, 10)
 p_active_md <- 1.3 # this can be set to your own limit, as long as the portfolio is capped at 1.5 on any given day
 weight_bounds <- c(0.0, 0.2)
 weight_matrix <- tibble()
+a = 0.6
+b = 1 - a
 
 # Signal & Weight Generation ----
 
@@ -92,7 +94,14 @@ for(i in 1:nrow(df_signals)){
     group_by(bond_code) %>% 
     mutate(md_per_conv = rollmeanr(return, n_days,na.pad = TRUE)*convexity/modified_duration) %>% 
     left_join(df_train_macro, by = "datestamp") %>% 
-    mutate(signal = md_per_conv*100 - top40_return/10 + comdty_fut/100)
+    mutate(
+      steepness = us_10y - us_2y,
+      sd_md = scale(modified_duration),
+      sd_steepness = scale(steepness),
+      signal = a*(sd_md*sd_steepness) + b*(sd_md+sd_steepness)
+    )
+  
+  df_train_bonds$signal[is.na(df_train_bonds$signal)] <- 0
   
   df_train_bonds_current <- 
     df_train_bonds %>% 
@@ -114,6 +123,7 @@ for(i in 1:nrow(df_signals)){
   turnover <- sum(abs(w - prev_weights))
   
   # Objective: maximise signal, but penalise excess turnover only
+  # print(signals)
   objective <- Maximize(t(signals) %*% w - turnover_lambda * turnover)
   
   # Constraints
@@ -231,3 +241,4 @@ elapsed <- as.numeric(difftime(t1, t0, units = "secs"))
 
 cat(sprintf("---> R Script End %s\n", t1))
 cat(sprintf("---> Total time taken %02d:%02d\n", floor(elapsed / 60), round(elapsed %% 60)))
+
