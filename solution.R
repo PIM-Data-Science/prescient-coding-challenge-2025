@@ -1,5 +1,5 @@
 # Load Packages ---- 
-
+ 
 install.packages("pacman")
 
 pacman::p_load(dplyr, readr, lubridate, slider, ggplot2, tidyr, zoo, CVXR, tictoc)
@@ -11,17 +11,18 @@ print(paste0('---> R Script Start ', t0))
 print('---> initial data set up')
 
 # instrument data
+
 df_bonds <- read_csv("data/data_bonds.csv") %>%
-  mutate(datestamp = as_date(datestamp))
+  # Changed date parsing from as_date() to mdy() to correctly parse 'datestamp' in "month/day/year" format
+  mutate(datestamp = mdy(datestamp))
+
+head(df_bonds$datestamp, 5)  # Check the first 5 dates to confirm parsing
 
 # albi data
-df_albi <- read_csv("data/data_albi.csv") %>%
-  mutate(datestamp = as_date(datestamp))
+df_albi <- read_csv("data/data_albi.csv")  # datestamp is already a date column
 
 # macro data
-df_macro <- read_csv("data/data_macro.csv") %>%
-  mutate(datestamp = as_date(datestamp))
-
+df_macro <- read_csv("data/data_macro.csv")  # datestamp is already a date column
 
 print('---> the parameters')
 
@@ -90,9 +91,10 @@ for(i in 1:nrow(df_signals)){
   df_train_bonds <- 
     df_train_bonds %>% 
     group_by(bond_code) %>% 
-    mutate(md_per_conv = rollmeanr(return, n_days,na.pad = TRUE)*convexity/modified_duration) %>% 
-    left_join(df_train_macro, by = "datestamp") %>% 
-    mutate(signal = md_per_conv*100 - top40_return/10 + comdty_fut/100)
+    mutate(md_per_conv = rollmeanr(return, n_days, na.pad = TRUE) * convexity / modified_duration) %>%
+    ungroup() %>%  # 🔑 This is critical to allow join to work correctly
+    left_join(df_train_macro, by = "datestamp") %>%
+    mutate(signal = md_per_conv * 50 + steepness - fx_vol)       # this is your strategy
   
   df_train_bonds_current <- 
     df_train_bonds %>% 
@@ -220,7 +222,7 @@ plot_md <- function(weight_matrix, df_bonds, df_albi) {
   } else {
     message("---> The portfolio does not breach the modified duration constraint")
   }
-}
+} 
 
 # Run visualizations
 plot_payoff(weight_matrix, df_bonds, df_albi)
@@ -229,5 +231,11 @@ plot_md(weight_matrix, df_bonds, df_albi)
 t1 = Sys.time()
 elapsed <- as.numeric(difftime(t1, t0, units = "secs"))
 
+#  THIS LINE SAVES THE WEIGHT MATRIX 
+
+write_csv(weight_matrix, "my_weight_matrix.csv")
+
 cat(sprintf("---> R Script End %s\n", t1))
 cat(sprintf("---> Total time taken %02d:%02d\n", floor(elapsed / 60), round(elapsed %% 60)))
+
+ 
