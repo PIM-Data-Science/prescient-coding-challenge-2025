@@ -1,375 +1,258 @@
 import numpy as np
 import pandas as pd
 import datetime
-import nbformat
-
+from sklearn.preprocessing import StandardScaler
 from scipy.optimize import minimize
 import plotly.express as px
-from scipy.stats import zscore
-from plotly.subplots import make_subplots
 
 print('---> Python Script Start', t0 := datetime.datetime.now())
 
-print('---> initial data set up')
-
-# instrument data
-df_bonds = pd.read_csv('C:\\Users\\Kamog\\Desktop\\sigma02\\prescient-coding-challenge-2025\\data\\data_bonds.csv')
+# Load data
+df_bonds = pd.read_csv('data_bonds.csv')
 df_bonds['datestamp'] = pd.to_datetime(df_bonds['datestamp']).apply(lambda d: d.date())
-
-# albi data
-df_albi = pd.read_csv('C:\\Users\\Kamog\\Desktop\\sigma02\\prescient-coding-challenge-2025\\data\\data_albi.csv')
+df_albi = pd.read_csv('data_albi.csv')
 df_albi['datestamp'] = pd.to_datetime(df_albi['datestamp']).apply(lambda d: d.date())
-
-# macro data
-df_macro = pd.read_csv('C:\\Users\\Kamog\\Desktop\\sigma02\\prescient-coding-challenge-2025\\data\\data_macro.csv')
+df_macro = pd.read_csv('data_macro.csv')
 df_macro['datestamp'] = pd.to_datetime(df_macro['datestamp']).apply(lambda d: d.date())
 
-print('---> the parameters')
-
-# training and test dates
+# Parameters
 start_train = datetime.date(2005, 1, 3)
-start_test = datetime.date(2023, 1, 3) # test set is this datasets 2023 & 2024 data
+start_test = datetime.date(2023, 1, 3)
 end_test = df_bonds['datestamp'].max()
-
-# 1st manipulation %%
-def preprocess_data(df_bonds, df_albi, df_macro):
-    """Enhanced data preprocessing with features based on available data"""
-    
-    # Calculate rolling statistics for bonds
-    for bond_code in df_bonds['bond_code'].unique():
-        bond_mask = df_bonds['bond_code'] == bond_code
-        
-        # Price-based features
-        df_bonds.loc[bond_mask, 'return_ma_5'] = df_bonds.loc[bond_mask, 'return'].rolling(window=5).mean()
-        df_bonds.loc[bond_mask, 'return_ma_20'] = df_bonds.loc[bond_mask, 'return'].rolling(window=20).mean()
-        df_bonds.loc[bond_mask, 'return_std_20'] = df_bonds.loc[bond_mask, 'return'].rolling(window=20).std()
-        
-        # Momentum and trend features
-        df_bonds.loc[bond_mask, 'momentum_5'] = df_bonds.loc[bond_mask, 'return'].rolling(window=5).sum()
-        df_bonds.loc[bond_mask, 'momentum_20'] = df_bonds.loc[bond_mask, 'return'].rolling(window=20).sum()
-        
-        # Volatility features
-        df_bonds.loc[bond_mask, 'volatility_ratio'] = (
-            df_bonds.loc[bond_mask, 'return'].rolling(window=5).std() / 
-            df_bonds.loc[bond_mask, 'return'].rolling(window=20).std()
-        )
-    
-    # Add macroeconomic features based on available data
-    # Yield curve (typically available in such datasets)
-    if 'us_10y' in df_macro.columns and 'us_2y' in df_macro.columns:
-        df_macro['yield_curve'] = df_macro['us_10y'] - df_macro['us_2y']
-        print("Added yield curve feature")
-    
-    # Risk-on/risk-off indicator (using equity and commodity data)
-    if 'top40_return' in df_macro.columns and 'comdty_fut' in df_macro.columns:
-        df_macro['risk_on_off'] = df_macro['top40_return'] - df_macro['comdty_fut']
-        print("Added risk on/off feature")
-    
-    # Merge macro data with bonds
-    df_bonds = df_bonds.merge(df_macro, on='datestamp', how='left')
-    
-    # Create bond-specific features using available macro data
-    if 'us_10y' in df_bonds.columns:
-        df_bonds['yield_spread'] = df_bonds['yield'] - df_bonds['us_10y']
-    
-    if 'top40_return' in df_bonds.columns:
-        df_bonds['equity_bond_correlation'] = df_bonds.groupby('bond_code')['return'].transform(
-            lambda x: x.rolling(20).corr(df_bonds['top40_return'].reindex(x.index))
-        )
-    
-    return df_bonds, df_albi, df_macro
-
-df_bonds, df_albi, df_macro = preprocess_data(df_bonds, df_albi, df_macro)
-
-
-# we will perform walk forward validation for testing the buys - https://www.linkedin.com/pulse/walk-forward-validation-yeshwanth-n
-df_signals = pd.DataFrame(data={'datestamp':df_bonds.loc[(df_bonds['datestamp']>=start_test) & (df_bonds['datestamp']<=end_test), 'datestamp'].values})
-df_signals.drop_duplicates(inplace=True)
-df_signals.reset_index(drop=True, inplace=True)
-df_signals.sort_values(by='datestamp', inplace=True) # this code just gets the dates that we need to generate buy signals for
-
-weight_matrix = pd.DataFrame()
-
-#2nd Manipulation %%
-
-# Enhanced optimization with risk management using available data
-def calculate_risk_metrics(returns, lookback=60):
-    """Calculate risk metrics for portfolio optimization"""
-    if len(returns) < lookback:
-        lookback = len(returns)
-    
-    recent_returns = returns[-lookback:]
-    volatility = np.std(recent_returns)
-    downside_returns = recent_returns[recent_returns < 0]
-    downside_volatility = np.std(downside_returns) if len(downside_returns) > 0 else 0
-    
-    return {
-        'volatility': volatility,
-        'downside_volatility': downside_volatility,
-        'var_95': np.percentile(recent_returns, 5) if len(recent_returns) > 0 else 0
-    }
-
-def enhanced_objective(weights, signals, prev_weights, risk_metrics, 
-                      turnover_lambda=0.1, risk_lambda=0.2, risk_aversion=1.0):
-  #  """Enhanced objective function with risk adjustment"""
-    # Return component
-    return_component = np.dot(weights, signals)
-    
-    # Turnover penalty
-    turnover = np.sum(np.abs(weights - prev_weights))
-    turnover_penalty = turnover_lambda * turnover
-    
-    # Risk penalty
-    risk_penalty = risk_lambda * risk_aversion * risk_metrics['volatility']
-    
-    # Downside risk penalty
-    downside_penalty = 0.5 * risk_lambda * risk_aversion * risk_metrics['downside_volatility']
-    
-    # Value at Risk constraint
-    var_penalty = 0 if risk_metrics['var_95'] > -0.05 else 10 * abs(risk_metrics['var_95'] + 0.05)
-    
-    return -(return_component - turnover_penalty - risk_penalty - downside_penalty - var_penalty)
-
-# Duration constraints
-def duration_constraint(weights, durations_today, p_albi_md, p_active_md=1.2):
-   # """Duration constraint function"""
-    port_duration = np.dot(weights, durations_today)
-    return [100 * (port_duration - (p_albi_md - p_active_md)), 
-            100 * ((p_albi_md + p_active_md) - port_duration)]
-
-# Concentration constraint
-def concentration_constraint(weights, max_weight=0.2):
-   # """Ensure no single asset exceeds max weight"""
-    return max_weight - np.max(weights)
-
-# This cell contains a sample solution
-# You are not restricted to the choice of signal, or the portfolio optimisation used to generate weights
-# You may modify anything within this cell as long as it produces a weight matrix in the required form, and the solution does not violate any of the rules
-
-# static data for optimisation and signal generation
-n_days = 10
-prev_weights = [0.1]*10
-p_active_md = 1.2 # this can be set to your own limit, as long as the portfolio is capped at 1.5 on any given day
+p_active_md = 1.5  # Max duration deviation
 weight_bounds = (0.0, 0.2)
+turnover_lambda = 0.1  # Turnover penalty
+
+print('---> Data Preparation')
+
+# Merge datasets
+df_albi_renamed = df_albi.rename(columns={'modified_duration': 'albi_modified_duration', 'return': 'albi_return'})
+df = pd.merge(df_bonds, df_albi_renamed[['datestamp', 'albi_modified_duration']], on='datestamp', how='left')
+df = pd.merge(df, df_macro, on='datestamp', how='left')
+
+# Sort for time-series operations
+df.sort_values(by=['bond_code', 'datestamp'], inplace=True)
+
+# Forward-fill missing values per bond
+fill_cols = ['yield', 'modified_duration', 'convexity', 'albi_modified_duration', 'us_10y', 'us_2y']
+for col in fill_cols:
+    if col in df.columns:
+        df[col] = df.groupby('bond_code')[col].ffill()
+
+# Drop rows with missing critical data
+df.dropna(subset=['yield', 'modified_duration', 'convexity', 'albi_modified_duration'], inplace=True)
+df.reset_index(drop=True, inplace=True)
+
+# Engineer features (causal, backward-looking)
+n_days_momentum = 5
+df['yield_momentum'] = df.groupby('bond_code')['yield'].transform(lambda x: (x - x.shift(n_days_momentum)) / (x.shift(n_days_momentum) + 1e-10))
+df['duration_spread'] = df['modified_duration'] - df['albi_modified_duration']
+df['steepness'] = df['us_10y'] - df['us_2y'] if 'us_10y' in df.columns and 'us_2y' in df.columns else 0
+
+# Feature list for scaling
+feature_names = ['convexity', 'yield_momentum', 'duration_spread', 'steepness']
+df[feature_names] = df[feature_names].fillna(0)
+
+# Walk-forward validation dates
+df_signals = pd.DataFrame({'datestamp': df.loc[(df['datestamp'] >= start_test) & (df['datestamp'] <= end_test), 'datestamp'].unique()})
+df_signals.sort_values(by='datestamp', inplace=True)
+df_signals.reset_index(drop=True, inplace=True)
+
+# Initialize weight matrix
+weight_matrix = pd.DataFrame()
+prev_weights = np.array([0.1] * 10)  # Equal weights start
+unique_bonds = sorted(df['bond_code'].unique())
+assert len(unique_bonds) == 10, f"Expected 10 bonds, got {len(unique_bonds)}"
+
+def adjust_weights_for_constraints(weights, durations, albi_md, max_iter=50, step_scale=0.05):
+    """Adjust weights to satisfy weight and duration constraints."""
+    weights = np.clip(weights, 0, 0.2)
+    weights /= np.sum(weights) + 1e-10
+    port_dur = np.dot(weights, durations)
+    diff = port_dur - albi_md
+    iteration = 0
+    while abs(diff) > 1.5 and iteration < max_iter:
+        if diff > 0:
+            idx_sort = np.argsort(durations)[::-1][:3]
+            for idx in idx_sort:
+                if diff <= 0 or weights[idx] <= 0: break
+                adjust = min(weights[idx], diff / (durations[idx] + 1e-10) * step_scale)
+                weights[idx] -= adjust
+                diff -= adjust * durations[idx]
+        else:
+            idx_sort = np.argsort(durations)[:3]
+            for idx in idx_sort:
+                if diff >= 0 or weights[idx] >= 0.2: break
+                adjust = min(0.2 - weights[idx], abs(diff) / (durations[idx] + 1e-10) * step_scale)
+                weights[idx] += adjust
+                diff += adjust * durations[idx]
+        weights = np.clip(weights, 0, 0.2)
+        weights /= np.sum(weights) + 1e-10
+        port_dur = np.dot(weights, durations)
+        diff = port_dur - albi_md
+        iteration += 1
+    return weights, abs(diff) <= 1.5
+
+print('---> Generating Signals and Weights')
 
 for i in range(len(df_signals)):
+    current_date = df_signals.loc[i, 'datestamp']
+    print(f'---> Processing {current_date}')
 
-    print('---> doing', df_signals.loc[i, 'datestamp'])    
+    # Split data
+    df_train = df[df['datestamp'] < current_date].copy()
+    df_current = df[df['datestamp'] == current_date].copy()
+    df_current_albi = df_albi[df_albi['datestamp'] == current_date].copy()
 
-    # this iterations training set
-    df_train_bonds = df_bonds[df_bonds['datestamp']<df_signals.loc[i, 'datestamp']].copy()
-    df_train_albi = df_albi[df_albi['datestamp']<df_signals.loc[i, 'datestamp']].copy()
-    df_train_macro = df_macro[df_macro['datestamp']<df_signals.loc[i, 'datestamp']].copy()
-
-    # this iterations test set
-    df_test_bonds = df_bonds[df_bonds['datestamp']>=df_signals.loc[i, 'datestamp']].copy()
-    df_test_albi = df_albi[df_albi['datestamp']>=df_signals.loc[i, 'datestamp']].copy()
-    df_test_macro = df_macro[df_macro['datestamp']>=df_signals.loc[i, 'datestamp']].copy()
-
-    p_albi_md = df_train_albi['modified_duration'].tail(1) #modified 
-
-    # feature engineering
-    df_train_macro['steepness'] = df_train_macro['us_10y'] - df_train_macro['us_2y'] 
-    df_train_bonds['md_per_conv'] = df_train_bonds.groupby(['bond_code'])['return'].transform(lambda x: x.rolling(window=n_days).mean()) * df_train_bonds['convexity'] / df_train_bonds['modified_duration']
-    #3rd Additional features based on available data
-    df_train_bonds['momentum'] = df_train_bonds.groupby(['bond_code'])['return'].transform(
-        lambda x: x.rolling(window=20).mean())
-    
-    df_train_bonds['volatility_ratio'] = df_train_bonds.groupby(['bond_code'])['return'].transform(
-        lambda x: x.rolling(window=5).std()) / df_train_bonds.groupby(['bond_code'])['return'].transform(
-        lambda x: x.rolling(window=20).std())
-    
-    #df_train_bonds = df_train_bonds.merge(df_train_macro, how='left', on = 'datestamp')
-        #5th Merge with available macro data
-    available_macro_cols = [col for col in df_train_macro.columns if col not in ['datestamp']]
-    df_train_bonds = df_train_bonds.merge(df_train_macro[['datestamp'] + available_macro_cols], 
-                                         how='left', on='datestamp')
-     # 7th Enhanced signal generation using available features
-    signal_components = []
-    #------------------
-        # Base signal component
-    signal_components.append(df_train_bonds['md_per_conv'] * 100)
-    
-    # Add available macro components to signal
-    if 'top40_return' in df_train_bonds.columns:
-        signal_components.append(-df_train_bonds['top40_return'] / 10)
-    
-    if 'comdty_fut' in df_train_bonds.columns:
-        signal_components.append(df_train_bonds['comdty_fut'] / 100)
-    
-    # Add momentum component
-    signal_components.append(df_train_bonds['momentum'] * 0.5)
-    
-    # Add volatility component (lower weight for volatile assets)
-    signal_components.append(-df_train_bonds['volatility_ratio'] * 0.3)
-    
-    # Add yield curve component if available
-    
-    if 'yield_curve' in df_train_bonds.columns:
-        signal_components.append(df_train_bonds['yield_curve'] * 0.2)
-    #------------------------
-    df_train_bonds['signal'] = sum(signal_components)
-    df_train_bonds_current = df_train_bonds[df_train_bonds['datestamp'] == df_train_bonds['datestamp'].max()]
-
-    #
-        #8th Calculate risk metrics
-    bond_returns = df_train_bonds.pivot(index='datestamp', columns='bond_code', values='return').fillna(0)
-    if len(prev_weights) == bond_returns.shape[1]:
-        portfolio_returns = bond_returns @ prev_weights
-        risk_metrics = calculate_risk_metrics(portfolio_returns.values)
+    # Handle missing data
+    if len(df_current) != 10 or df_current_albi.empty:
+        print(f"Warning: Missing data for {current_date}. Using adjusted equal weights.")
+        optimal_weights = np.array([0.1] * 10)
+        p_albi_md = df_albi[df_albi['datestamp'] <= current_date]['modified_duration'].iloc[-1] if not df_albi[df_albi['datestamp'] <= current_date].empty else 5.0
+        current_durations = df_current['modified_duration'].values if len(df_current) == 10 else np.array([5.0] * 10)
+        optimal_weights, _ = adjust_weights_for_constraints(optimal_weights, current_durations, p_albi_md)
     else:
-        risk_metrics = {'volatility': 0.1, 'downside_volatility': 0.05, 'var_95': -0.02}
-        
-    # optimisation objective
-    def objective(weights, signal, prev_weights, turnover_lambda=0.1):
-        turnover = np.sum(np.abs(weights - prev_weights))
-        return -(np.dot(weights, signal) - turnover_lambda * turnover)
-        
-    # Duration constraints
-    def duration_constraint(weights, durations_today, p_albi_md, p_active=1.2):
-        port_duration = np.dot(weights, durations_today)
-        return [100*(port_duration - (p_albi_md - p_active_md)), 100*((p_albi_md + p_active_md) - port_duration)]
-    
-    # Optimization setup
-    turnover_lambda = 0.5
-    bounds = [weight_bounds] * 10
-    constraints = [
-        {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},  # weights sum to 1
-        {'type': 'ineq', 'fun': lambda w: duration_constraint(w, df_train_bonds_current['modified_duration'], p_albi_md, p_active_md)[0]},
-        {'type': 'ineq', 'fun': lambda w: duration_constraint(w, df_train_bonds_current['modified_duration'], p_albi_md, p_active_md)[1]},
-        {'type': 'ineq', 'fun': lambda w: concentration_constraint(w, 0.2)}  # No asset > 20%
-    ]
+        # Ensure all bonds
+        # Ensure all bonds are present for the current date
+        df_current_info = df_current.set_index('bond_code').reindex(unique_bonds).reset_index()
+        df_current_info[feature_names] = df_current_info[feature_names].fillna(0)
+        df_current_info['modified_duration'] = df_current_info['modified_duration'].fillna(df_current_info['albi_modified_duration'].fillna(5.0))
+        df_current_info['return'] = df_current_info['return'].fillna(0.0)
 
-    result = minimize(objective, prev_weights, args=(df_train_bonds_current['signal'], prev_weights, turnover_lambda), bounds=bounds, constraints=constraints)
+        # Scale features
+        scaler = StandardScaler()
+        if not df_train.empty:
+            scaler.fit(df_train[feature_names])
+        else:
+            scaler.fit(df_current_info[feature_names])
+        features_scaled = scaler.transform(df_current_info[feature_names])
+        df_features_scaled = pd.DataFrame(features_scaled, columns=feature_names, index=df_current_info.index)
 
-    optimal_weights = result.x if result.success else prev_weights
-    weight_matrix_tmp = pd.DataFrame({'bond_code': df_train_bonds_current['bond_code'],
-                                      'weight': optimal_weights,
-                                      'datestamp': df_signals.loc[i, 'datestamp']})
-    weight_matrix = pd.concat([weight_matrix, weight_matrix_tmp])
+        # Generate signals (favor high convexity, falling yields, ALBI-aligned duration)
+        signal = (
+            df_features_scaled['convexity'] * 1.0
+            - df_features_scaled['yield_momentum'] * 0.5
+            - np.abs(df_features_scaled['duration_spread']) * 1.0
+            + df_features_scaled['steepness'] * 0.3
+        )
 
-    prev_weights = optimal_weights
+        # Optimization setup
+        p_albi_md = df_current_albi['modified_duration'].iloc[0]
+        current_durations = df_current_info['modified_duration'].values
 
-    def enhanced_plot_payoff(weight_matrix, df_bonds, df_albi):
-    
-    # Check weights sum to one
+        def objective(weights, signal_scores, prev_w, lambda_penalty):
+            turnover = np.sum(np.abs(weights - prev_w))
+            return -np.dot(weights, signal_scores) + lambda_penalty * turnover
+
+        def duration_constraint(weights, durations, albi_md):
+            port_duration = np.dot(weights, durations)
+            return [
+                (albi_md + p_active_md) - port_duration,  # <= albi + 1.5
+                port_duration - (albi_md - p_active_md)   # >= albi - 1.5
+            ]
+
+        constraints = [
+            {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0},
+            {'type': 'ineq', 'fun': lambda w: duration_constraint(w, current_durations, p_albi_md)[0]},
+            {'type': 'ineq', 'fun': lambda w: duration_constraint(w, current_durations, p_albi_md)[1]}
+        ]
+        bounds = [weight_bounds] * 10
+        optimizer_options = {'maxiter': 1000, 'ftol': 1e-14, 'disp': False}
+
+        # Initial guess: equal weights adjusted for duration
+        initial_weights = np.array([0.1] * 10)
+        initial_weights, _ = adjust_weights_for_constraints(initial_weights, current_durations, p_albi_md)
+
+        # Optimize
+        result = minimize(
+            objective,
+            initial_weights,
+            args=(signal.values, prev_weights, turnover_lambda),
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints,
+            options=optimizer_options
+        )
+
+        optimal_weights = result.x if result.success else initial_weights
+
+        # Enforce constraints
+        optimal_weights = np.clip(optimal_weights, 0, 0.2)
+        optimal_weights /= np.sum(optimal_weights) + 1e-10
+
+        # Adjust for duration
+        optimal_weights, success = adjust_weights_for_constraints(optimal_weights, current_durations, p_albi_md)
+        if not success:
+            print(f"Warning: Duration adjustment failed for {current_date}. Using equal weights.")
+            optimal_weights = np.array([0.1] * 10)
+            optimal_weights, _ = adjust_weights_for_constraints(optimal_weights, current_durations, p_albi_md)
+
+    # Store weights
+    weight_matrix_tmp = pd.DataFrame({
+        'datestamp': [current_date] * 10,
+        'bond_code': unique_bonds,
+        'weight': optimal_weights
+    })
+    weight_matrix = pd.concat([weight_matrix, weight_matrix_tmp], ignore_index=True)
+    prev_weights = optimal_weights.copy()
+
+def plot_payoff(weight_matrix):
     df_weight_sum = weight_matrix.groupby(['datestamp'])['weight'].sum()
     if df_weight_sum.min() < 0.9999 or df_weight_sum.max() > 1.0001:
         raise ValueError('The portfolio weights do not sum to one')
-    
-    # Check weights between 0 and 0.2
-    if weight_matrix['weight'].min() < 0 or weight_matrix['weight'].max() > 0.20001:
+    if weight_matrix['weight'].min() < -0.00001 or weight_matrix['weight'].max() > 0.20001:
         raise ValueError(r'The instrument weights are not confined to 0%-20%')
 
-    # Check we have 10 bonds
-    unique_bonds = weight_matrix['bond_code'].nunique()
-    print(f"---> Number of unique bonds in portfolio: {unique_bonds}")
-    if unique_bonds != 10:
-        print(f"---> WARNING: Expected 10 bonds, found {unique_bonds}")
+    fig_weights = px.area(weight_matrix, x="datestamp", y="weight", color="bond_code", title="Portfolio Weights Over Time")
+    fig_weights.show()
 
-    # Calculate portfolio performance
     port_data = weight_matrix.merge(df_bonds, on=['bond_code', 'datestamp'], how='left')
-    
-    # FIXED: Calculate turnover correctly
-    # Sort by date and bond code to ensure proper diff calculation
-    weight_matrix_sorted = weight_matrix.sort_values(['datestamp', 'bond_code'])
-    df_turnover = weight_matrix_sorted.copy()
-    
-    # Calculate absolute weight changes for each bond
-    df_turnover['weight_change'] = df_turnover.groupby('bond_code')['weight'].diff().abs()
-    
-    # Sum weight changes across all bonds for each date
-    daily_turnover = df_turnover.groupby('datestamp')['weight_change'].sum() / 2  # Divide by 2 because each trade affects both buy and sell sides
-    
-    # Create port_data with proper turnover
-    port_data = weight_matrix.merge(df_bonds, on=['bond_code', 'datestamp'], how='left')
+    df_turnover = weight_matrix.copy()
+    df_turnover.sort_values(['bond_code', 'datestamp'], inplace=True)
+    df_turnover['prev_weight'] = df_turnover.groupby('bond_code')['weight'].shift(1).fillna(0.1)
+    df_turnover['turnover_abs_change'] = (df_turnover['weight'] - df_turnover['prev_weight']).abs()
+    daily_turnover = df_turnover.groupby('datestamp')['turnover_abs_change'].sum()
+
     port_data['port_return'] = port_data['return'] * port_data['weight']
     port_data['port_md'] = port_data['modified_duration'] * port_data['weight']
-
     port_data = port_data.groupby("datestamp")[['port_return', 'port_md']].sum().reset_index()
+    port_data = port_data.merge(daily_turnover.rename('turnover'), on='datestamp', how='left')
     
-    # Merge turnover data
-    port_data = port_data.merge(daily_turnover.reset_index(), on='datestamp', how='left')
-    port_data.rename(columns={'weight_change': 'turnover'}, inplace=True)
-    
-    # Fill NaN values with 0 for the first day
-    port_data['turnover'] = port_data['turnover'].fillna(0)
-    
-    port_data['penalty'] = 0.005 * port_data['turnover'] * port_data['port_md'].shift()
-    port_data['net_return'] = port_data['port_return'].sub(port_data['penalty'], fill_value=0)
+    port_data['penalty'] = 0.0001 * port_data['turnover'] * port_data['port_md'].shift().fillna(0)
+    port_data['net_return'] = port_data['port_return'].sub(port_data['penalty'].fillna(0))
     port_data = port_data.merge(df_albi[['datestamp', 'return']], on='datestamp', how='left')
     port_data['portfolio_tri'] = (port_data['net_return'] / 100 + 1).cumprod()
     port_data['albi_tri'] = (port_data['return'] / 100 + 1).cumprod()
-    
-    # Plot weights through time - check if we have 10 bonds
-    bond_count = weight_matrix['bond_code'].nunique()
-    print(f"---> Plotting weights for {bond_count} bonds")
-    
-    fig_weights = px.area(weight_matrix, x="datestamp", y="weight", color="bond_code", 
-                         title=f"Portfolio Weights ({bond_count} bonds)")
-    fig_weights.show()
 
-    # Plot cumulative returns
-    fig_returns = px.line(port_data, x='datestamp', y=['portfolio_tri', 'albi_tri'], 
-                         title='Cumulative Returns')
-    fig_returns.show()
-    
-    # Plot turnover - check if we have data
-    print(f"---> Turnover data range: {port_data['turnover'].min():.4f} to {port_data['turnover'].max():.4f}")
-    fig_turnover = px.line(port_data, x='datestamp', y='turnover', title='Portfolio Turnover')
+    fig_turnover = px.line(port_data, x='datestamp', y='turnover', title='Daily Portfolio Turnover')
     fig_turnover.show()
-    
-    # Plot active modified duration
+
+    print(f"---> Payoff for these buys between period {port_data['datestamp'].min()} and {port_data['datestamp'].max()} is {(port_data['portfolio_tri'].values[-1]-1)*100 :.2f}%")
+    print(f"---> Payoff for the ALBI benchmark for this period is {(port_data['albi_tri'].values[-1]-1)*100 :.2f}%")
+
+    port_data_melted = pd.melt(port_data[['datestamp', 'portfolio_tri', 'albi_tri']], id_vars='datestamp', var_name='Index', value_name='TRI')
+    fig_payoff = px.line(port_data_melted, x='datestamp', y='TRI', color='Index', title='Portfolio vs. ALBI Total Return Index (TRI)')
+    fig_payoff.show()
+
+def plot_md(weight_matrix):
+    port_data = weight_matrix.merge(df_bonds, on=['bond_code', 'datestamp'], how='left')
+    port_data['port_md'] = port_data['modified_duration'] * port_data['weight']
+    port_data = port_data.groupby("datestamp")[['port_md']].sum().reset_index()
     port_data = port_data.merge(df_albi[['datestamp', 'modified_duration']], on='datestamp', how='left')
     port_data['active_md'] = port_data['port_md'] - port_data['modified_duration']
-    
-    fig_md = px.line(port_data, x='datestamp', y='active_md', title='Active Modified Duration')
+
+    fig_md = px.line(port_data, x='datestamp', y='active_md', title='Active Modified Duration (Portfolio - ALBI)')
     fig_md.add_hline(y=1.5, line_dash="dash", line_color="red")
     fig_md.add_hline(y=-1.5, line_dash="dash", line_color="red")
     fig_md.show()
-    
-    # Calculate additional metrics
-    port_data['excess_return'] = port_data['net_return'] - port_data['return']
-    port_data['cumulative_excess'] = (port_data['excess_return'] / 100 + 1).cumprod()
-    
-    # Rolling Sharpe ratio (6-month)
-    returns_series = port_data.set_index('datestamp')['net_return'] / 100
-    rolling_sharpe = returns_series.rolling(126).mean() / returns_series.rolling(126).std() * np.sqrt(252)
-    port_data['rolling_sharpe'] = rolling_sharpe.values
-    
-    # Plot rolling Sharpe ratio
-    fig_sharpe = px.line(port_data, x='datestamp', y='rolling_sharpe', title='Rolling Sharpe Ratio (6M)')
-    fig_sharpe.show()
-    
-    # Drawdown calculation
-    port_data['peak'] = port_data['portfolio_tri'].cummax()
-    port_data['drawdown'] = (port_data['portfolio_tri'] - port_data['peak']) / port_data['peak']
 
-    # Plot drawdown
-    fig_drawdown = px.area(port_data, x='datestamp', y='drawdown', title='Drawdown')
-    fig_drawdown.show()
+    if len(port_data[abs(port_data['active_md']) > 1.5001]['datestamp']) == 0:
+        print(f"---> The portfolio does not breach the modified duration constraint")
+    else:
+        raise ValueError('This buy matrix violates the modified duration constraint on the below dates: \n ' + ", ".join(pd.to_datetime(port_data[abs(port_data['active_md']) > 1.5001]['datestamp']).dt.strftime("%Y-%m-%d")))
 
-    # Print performance statistics
-    total_return = (port_data['portfolio_tri'].values[-1] - 1) * 100
-    benchmark_return = (port_data['albi_tri'].values[-1] - 1) * 100
-    excess_return = total_return - benchmark_return
-    
-    volatility = port_data['net_return'].std() * np.sqrt(252)
-    sharpe_ratio = (port_data['net_return'].mean() / port_data['net_return'].std()) * np.sqrt(252) if port_data['net_return'].std() > 0 else 0
-    
-    max_drawdown = port_data['drawdown'].min() * 100
-    
-    print(f"---> Portfolio return: {total_return:.2f}%")
-    print(f"---> Benchmark return: {benchmark_return:.2f}%")
-    print(f"---> Excess return: {excess_return:.2f}%")
-    print(f"---> Annualized volatility: {volatility:.2f}%")
-    print(f"---> Sharpe ratio: {sharpe_ratio:.2f}")
-    print(f"---> Maximum drawdown: {max_drawdown:.2f}%")
-    print(f"---> Average daily turnover: {port_data['turnover'].mean():.4f}")
-    
-    return port_data
+plot_payoff(weight_matrix)
+plot_md(weight_matrix)
 
-# Make sure the function is called
-print("---> Running enhanced payoff analysis...")
-port_data = enhanced_plot_payoff(weight_matrix, df_bonds, df_albi)
-print("---> Enhanced analysis completed!")
+print('---> Python Script End', t1 := datetime.datetime.now())
+print('---> Total time taken', t1 - t0)
