@@ -13,7 +13,6 @@ print('---> Python Script Start', t0 := datetime.datetime.now())
 # %%
 
 print('---> initial data set up')
-nwankcqmeklngfop
 # instrument data
 df_bonds = pd.read_csv('data/data_bonds.csv')
 df_bonds['datestamp'] = pd.to_datetime(df_bonds['datestamp']).apply(lambda d: d.date())
