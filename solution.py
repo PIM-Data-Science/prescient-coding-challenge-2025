@@ -13,17 +13,17 @@ print('---> Python Script Start', t0 := datetime.datetime.now())
 # %%
 
 print('---> initial data set up')
-nwankcqmeklngfop
+
 # instrument data
-df_bonds = pd.read_csv('data/data_bonds.csv')
+df_bonds = pd.read_csv("C:\\Users\\bmahl\\Downloads\\prescient2\\prescient-coding-challenge-2025\\data\\data_bonds.csv")
 df_bonds['datestamp'] = pd.to_datetime(df_bonds['datestamp']).apply(lambda d: d.date())
 
 # albi data
-df_albi = pd.read_csv('data/data_albi.csv')
+df_albi = pd.read_csv("C:\\Users\\bmahl\\Downloads\\prescient2\\prescient-coding-challenge-2025\\data\\data_albi.csv")
 df_albi['datestamp'] = pd.to_datetime(df_albi['datestamp']).apply(lambda d: d.date())
 
 # macro data
-df_macro = pd.read_csv('data/data_macro.csv')
+df_macro = pd.read_csv("C:\\Users\\bmahl\\Downloads\\prescient2\\prescient-coding-challenge-2025\\data\\data_macro.csv")
 df_macro['datestamp'] = pd.to_datetime(df_macro['datestamp']).apply(lambda d: d.date())
 
 print('---> the parameters')
@@ -51,7 +51,7 @@ weight_matrix = pd.DataFrame()
 # You may modify anything within this cell as long as it produces a weight matrix in the required form, and the solution does not violate any of the rules
 
 # static data for optimisation and signal generation
-n_days = 10
+n_days = df_bonds['bond_code'].nunique()
 prev_weights = [0.1]*10
 p_active_md = 1.2 # this can be set to your own limit, as long as the portfolio is capped at 1.5 on any given day
 weight_bounds = (0.0, 0.2)
@@ -76,11 +76,12 @@ for i in range(len(df_signals)):
     df_train_macro['steepness'] = df_train_macro['us_10y'] - df_train_macro['us_2y'] 
     df_train_bonds['md_per_conv'] = df_train_bonds.groupby(['bond_code'])['return'].transform(lambda x: x.rolling(window=n_days).mean()) * df_train_bonds['convexity'] / df_train_bonds['modified_duration']
     df_train_bonds = df_train_bonds.merge(df_train_macro, how='left', on = 'datestamp')
-    df_train_bonds['signal'] = df_train_bonds['md_per_conv']*100 - df_train_bonds['top40_return']/10 + df_train_bonds['comdty_fut']/100
+    df_train_bonds['yield_ma'] = df_train_bonds.groupby('bond_code')['yield'].transform(lambda x: x.rolling(window=n_days).mean()) #Yield momentum signal
+    df_train_bonds['signal'] = df_train_bonds['yield'] - df_train_bonds['yield_ma']
     df_train_bonds_current = df_train_bonds[df_train_bonds['datestamp'] == df_train_bonds['datestamp'].max()]
     
     # optimisation objective
-    def objective(weights, signal, prev_weights, turnover_lambda=0.1):
+    def objective(weights, signal, prev_weights, turnover_lambda=0.5):
         turnover = np.sum(np.abs(weights - prev_weights))
         return -(np.dot(weights, signal) - turnover_lambda * turnover)
         
@@ -97,9 +98,9 @@ for i in range(len(df_signals)):
         {'type': 'ineq', 'fun': lambda w: duration_constraint(w, df_train_bonds_current['modified_duration'])[0]},
         {'type': 'ineq', 'fun': lambda w: duration_constraint(w, df_train_bonds_current['modified_duration'])[1]}
     ]
-
+    
     result = minimize(objective, prev_weights, args=(df_train_bonds_current['signal'], prev_weights, turnover_lambda), bounds=bounds, constraints=constraints)
-
+    
     optimal_weights = result.x if result.success else prev_weights
     weight_matrix_tmp = pd.DataFrame({'bond_code': df_train_bonds_current['bond_code'],
                                       'weight': optimal_weights,
