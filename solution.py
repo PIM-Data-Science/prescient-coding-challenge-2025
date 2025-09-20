@@ -51,9 +51,9 @@ weight_matrix = pd.DataFrame()
 # You may modify anything within this cell as long as it produces a weight matrix in the required form, and the solution does not violate any of the rules
 
 # static data for optimisation and signal generation
-n_days = 10
+n_days = 5
 prev_weights = [0.1]*10
-p_active_md = 1.2 # this can be set to your own limit, as long as the portfolio is capped at 1.5 on any given day
+p_active_md = 0.5 # this can be set to your own limit, as long as the portfolio is capped at 1.5 on any given day
 weight_bounds = (0.0, 0.2)
 
 for i in range(len(df_signals)):
@@ -76,13 +76,31 @@ for i in range(len(df_signals)):
     df_train_macro['steepness'] = df_train_macro['us_10y'] - df_train_macro['us_2y'] 
     df_train_bonds['md_per_conv'] = df_train_bonds.groupby(['bond_code'])['return'].transform(lambda x: x.rolling(window=n_days).mean()) * df_train_bonds['convexity'] / df_train_bonds['modified_duration']
     df_train_bonds = df_train_bonds.merge(df_train_macro, how='left', on = 'datestamp')
-    df_train_bonds['signal'] = df_train_bonds['md_per_conv']*100 - df_train_bonds['top40_return']/10 + df_train_bonds['comdty_fut']/100
-    df_train_bonds_current = df_train_bonds[df_train_bonds['datestamp'] == df_train_bonds['datestamp'].max()]
-    
+    # --- regression-based signal ---
+    features = ['md_per_conv', 'top40_return', 'comdty_fut']
+    # target is next-day return
+    df_train_bonds['target'] = df_train_bonds.groupby('bond_code')['return'].shift(-1)
+
+    # drop NaNs for regression
+    mask = df_train_bonds[features + ['target']].notna().all(axis=1)
+    X = df_train_bonds.loc[mask, features].values
+    y = df_train_bonds.loc[mask, 'target'].values
+
+    # learn linear weights
+    beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+
+    # create the signal using learned weights
+    df_train_bonds.loc[:, 'signal'] = df_train_bonds[features].dot(beta)
+
+    df_train_bonds_current = df_train_bonds[df_train_bonds['datestamp'] == df_train_bonds['datestamp'].max()].copy()
+    df_train_bonds_current['signal_scaled'] = df_train_bonds_current['signal'] * 50
+
+
+
     # optimisation objective
-    def objective(weights, signal, prev_weights, turnover_lambda=0.1):
+    def objective(weights, signal_scaled, prev_weights, turnover_lambda=0.01):
         turnover = np.sum(np.abs(weights - prev_weights))
-        return -(np.dot(weights, signal) - turnover_lambda * turnover)
+        return -(np.dot(weights, signal_scaled) - turnover_lambda * turnover)
         
     # Duration constraints
     def duration_constraint(weights, durations_today):
@@ -98,7 +116,7 @@ for i in range(len(df_signals)):
         {'type': 'ineq', 'fun': lambda w: duration_constraint(w, df_train_bonds_current['modified_duration'])[1]}
     ]
 
-    result = minimize(objective, prev_weights, args=(df_train_bonds_current['signal'], prev_weights, turnover_lambda), bounds=bounds, constraints=constraints)
+    result = minimize(objective, prev_weights, args=(df_train_bonds_current['signal_scaled'], prev_weights, turnover_lambda), bounds=bounds, constraints=constraints)
 
     optimal_weights = result.x if result.success else prev_weights
     weight_matrix_tmp = pd.DataFrame({'bond_code': df_train_bonds_current['bond_code'],
