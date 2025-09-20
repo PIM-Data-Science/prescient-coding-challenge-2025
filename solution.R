@@ -11,15 +11,15 @@ print(paste0('---> R Script Start ', t0))
 print('---> initial data set up')
 
 # instrument data
-df_bonds <- read_csv("data_bonds.csv") %>%
+df_bonds <- read_csv("data/data_bonds.csv") %>%
   mutate(datestamp = as_date(datestamp))
 
 # albi data
-df_albi <- read_csv("data_albi.csv") %>%
+df_albi <- read_csv("data/data_albi.csv") %>%
   mutate(datestamp = as_date(datestamp))
 
 # macro data
-df_macro <- read_csv("data_macro.csv") %>%
+df_macro <- read_csv("data/data_macro.csv") %>%
   mutate(datestamp = as_date(datestamp))
 
 
@@ -241,3 +241,4 @@ elapsed <- as.numeric(difftime(t1, t0, units = "secs"))
 
 cat(sprintf("---> R Script End %s\n", t1))
 cat(sprintf("---> Total time taken %02d:%02d\n", floor(elapsed / 60), round(elapsed %% 60)))
+
