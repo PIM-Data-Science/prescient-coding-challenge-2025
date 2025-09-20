@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 import datetime
+from scipy.optimize import minimize
 import nbformat
 
 from scipy.optimize import minimize
@@ -73,41 +74,104 @@ for i in range(len(df_signals)):
     p_albi_md = df_train_albi['modified_duration'].tail(1)
 
     # feature engineering
-    df_train_macro['steepness'] = df_train_macro['us_10y'] - df_train_macro['us_2y'] 
-    df_train_bonds['md_per_conv'] = df_train_bonds.groupby(['bond_code'])['return'].transform(lambda x: x.rolling(window=n_days).mean()) * df_train_bonds['convexity'] / df_train_bonds['modified_duration']
-    df_train_bonds = df_train_bonds.merge(df_train_macro, how='left', on = 'datestamp')
-    df_train_bonds['signal'] = df_train_bonds['md_per_conv']*100 - df_train_bonds['top40_return']/10 + df_train_bonds['comdty_fut']/100
+    # --- COMPOSITE RULE-BASED SIGNAL ---
+
+    # --- 1) Macro features ---
+    df_train_macro['steepness'] = df_train_macro['us_10y'] - df_train_macro['us_2y']
+
+    # --- 2) Rolling momentum & volatility ---
+    rolling_windows = [5, 10, 20]
+    for w in rolling_windows:
+        df_train_bonds[f'return_ma{w}'] = df_train_bonds.groupby('bond_code')['return'].transform(lambda x: x.rolling(w).mean())
+        df_train_bonds[f'return_vol{w}'] = df_train_bonds.groupby('bond_code')['return'].transform(lambda x: x.rolling(w).std())
+
+    # --- 3) Duration-adjusted returns ---
+    df_train_bonds['signal_duration'] = df_train_bonds['return'] * df_train_bonds['convexity'] / df_train_bonds['modified_duration']
+
+    # --- 4) Yield spike component ---
+    df_train_bonds['yield_ma5'] = df_train_bonds.groupby('bond_code')['yield'].transform(lambda x: x.rolling(5).mean())
+    df_train_bonds['yield_ma10'] = df_train_bonds.groupby('bond_code')['yield'].transform(lambda x: x.rolling(10).mean())
+    df_train_bonds['yield_spike'] = (df_train_bonds['yield_ma5'] - df_train_bonds['yield_ma10']) * df_train_bonds['modified_duration']
+
+    # --- 5) Merge macro into bond data ---
+    df_train_bonds = df_train_bonds.merge(df_train_macro[['datestamp', 'steepness']], on='datestamp', how='left')
+
+    # --- 6) Combine features into composite signal ---
+    df_train_bonds['composite_signal'] = (
+        df_train_bonds['return_ma10'].rank(method='average') +
+        df_train_bonds['signal_duration'].rank(method='average') +
+        df_train_bonds['steepness'].rank(method='average') +
+        df_train_bonds['yield_spike'].rank(method='average')
+    )
+
+    # --- 7) Select current day ---
     df_train_bonds_current = df_train_bonds[df_train_bonds['datestamp'] == df_train_bonds['datestamp'].max()]
+
+    # --- 8) Normalize for optimizer ---
+    signal_std = (df_train_bonds_current['composite_signal'] - df_train_bonds_current['composite_signal'].mean()) / (df_train_bonds_current['composite_signal'].std() + 1e-8)
+    df_train_bonds_current = df_train_bonds[df_train_bonds['datestamp'] == df_train_bonds['datestamp'].max()].copy()
+    df_train_bonds_current['signal'] = signal_std
     
-    # optimisation objective
-    def objective(weights, signal, prev_weights, turnover_lambda=0.1):
+    # --- Improved optimization --- 
+
+    # Check for constant signal
+    if df_train_bonds_current['composite_signal'].std() < 1e-8:
+        signal = np.zeros(len(df_train_bonds_current))
+    else:
+        signal = (df_train_bonds_current['composite_signal'] - df_train_bonds_current['composite_signal'].mean()) \
+                / (df_train_bonds_current['composite_signal'].std() + 1e-8)
+
+    # Compute recent covariance matrix for risk adjustment
+    cov_matrix = df_train_bonds[df_train_bonds['datestamp'] >= df_train_bonds['datestamp'].max() - pd.Timedelta(days=30)] \
+                .pivot(index='datestamp', columns='bond_code', values='return').cov().fillna(0).values
+
+    # --- Optimisation setup ---
+    turnover_lambda = 0.5
+    bounds = [(0.0, 0.2)] * 10  # strict 0%-20% per instrument
+
+    def objective(weights, signal, prev_weights, turnover_lambda=0.5):
         turnover = np.sum(np.abs(weights - prev_weights))
-        return -(np.dot(weights, signal) - turnover_lambda * turnover)
-        
-    # Duration constraints
+        turnover_penalty = turnover_lambda * (turnover**1.5)
+        return -(np.dot(weights, signal) - turnover_penalty)
+
     def duration_constraint(weights, durations_today):
         port_duration = np.dot(weights, durations_today)
-        return [100*(port_duration - (p_albi_md - p_active_md)), 100*((p_albi_md + p_active_md) - port_duration)]
-    
-    # Optimization setup
-    turnover_lambda = 0.5
-    bounds = [weight_bounds] * 10
+        return [port_duration - (p_albi_md - p_active_md), (p_albi_md + p_active_md) - port_duration]
+
     constraints = [
         {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},  # weights sum to 1
         {'type': 'ineq', 'fun': lambda w: duration_constraint(w, df_train_bonds_current['modified_duration'])[0]},
         {'type': 'ineq', 'fun': lambda w: duration_constraint(w, df_train_bonds_current['modified_duration'])[1]}
     ]
 
-    result = minimize(objective, prev_weights, args=(df_train_bonds_current['signal'], prev_weights, turnover_lambda), bounds=bounds, constraints=constraints)
+    result = minimize(
+        objective,
+        prev_weights,
+        args=(df_train_bonds_current['signal'], prev_weights, turnover_lambda),
+        method='SLSQP',
+        bounds=bounds,
+        constraints=constraints,
+        options={'ftol': 1e-9, 'disp': False, 'maxiter': 100}
+    )
 
-    optimal_weights = result.x if result.success else prev_weights
-    weight_matrix_tmp = pd.DataFrame({'bond_code': df_train_bonds_current['bond_code'],
-                                      'weight': optimal_weights,
-                                      'datestamp': df_signals.loc[i, 'datestamp']})
+    # --- Use optimizer solution or fallback ---
+    if result.success:
+        optimal_weights = np.clip(result.x, 0, 0.2)  # clip tiny floating point violations
+    else:
+        optimal_weights = prev_weights  # fallback
+
+    # --- Store weights ---
+    weight_matrix_tmp = pd.DataFrame({
+        'bond_code': df_train_bonds_current['bond_code'],
+        'weight': optimal_weights,
+        'datestamp': df_signals.loc[i, 'datestamp']
+    })
     weight_matrix = pd.concat([weight_matrix, weight_matrix_tmp])
 
     prev_weights = optimal_weights
+
 # %%
+print([f"{x:.4f}" for x in optimal_weights])
 
 def plot_payoff(weight_matrix):
 
