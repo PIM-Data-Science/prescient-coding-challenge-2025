@@ -44,10 +44,10 @@ df_signals <- df_bonds %>%
 
 
 # parameters for optimisation - in this sample solution we use a momentum lookback strategy
-n_days <- 10
+n_days <- 30
 prev_weights <- rep(0.1, 10)
-p_active_md <- 1.3 # this can be set to your own limit, as long as the portfolio is capped at 1.5 on any given day
-weight_bounds <- c(0.0, 0.2)
+p_active_md <- 1.2 # this can be set to your own limit, as long as the portfolio is capped at 1.5 on any given day
+weight_bounds <- c(0, 0.2)
 weight_matrix <- tibble()
 
 # Signal & Weight Generation ----
@@ -98,7 +98,34 @@ for(i in 1:nrow(df_signals)){
     df_train_bonds %>% 
     filter(datestamp == max(datestamp)) %>% 
     mutate(active_md = modified_duration - p_albi_md)
+  df_train_bonds_current <- df_train_bonds_current %>%
+  mutate(signal = 0)   # initialise
+
+for (b in unique(df_train_bonds_current$bond_code)) {
+  df_bond <- df_train_bonds %>% filter(bond_code == b)
   
+  if (nrow(df_bond) > 250) {
+    # Forecast yield (AR(1))
+    fit_y <- tryCatch(arima(df_bond$yield, order=c(1,0,0)), error=function(e) NULL)
+    y_hat <- if(!is.null(fit_y)) predict(fit_y, n.ahead=1)$pred[1] else tail(df_bond$yield, 1)
+    
+    # Forecast modified duration (AR(1))
+    fit_md <- tryCatch(arima(df_bond$modified_duration, order=c(1,0,0)), error=function(e) NULL)
+    md_hat <- if(!is.null(fit_md)) predict(fit_md, n.ahead=1)$pred[1] else tail(df_bond$modified_duration, 1)
+    
+    # Current values
+    y_t   <- tail(df_bond$yield, 1)
+    conv  <- tail(df_bond$convexity, 1)
+    
+    
+    # Forecast return using duration-convexity formula
+    dy <- (y_hat - y_t)
+    signal_val <- - md_hat * dy + 0.5 * conv * (dy^2)
+    
+    df_train_bonds_current$signal[df_train_bonds_current$bond_code==b] <- signal_val
+  }
+}
+
   # --- Optimisation setup ---
   n <- nrow(df_train_bonds_current)
   signals <- df_train_bonds_current$signal
@@ -108,13 +135,13 @@ for(i in 1:nrow(df_signals)){
   w <- Variable(n)
   
   # Parameters
-  turnover_lambda <- 0.5             # penalty weight for excess turnover
+  turnover_lambda <-  3      # penalty weight for excess turnover
   
   # Define turnover
   turnover <- sum(abs(w - prev_weights))
   
   # Objective: maximise signal, but penalise excess turnover only
-  objective <- Maximize(t(signals) %*% w - turnover_lambda * turnover)
+  objective <- Maximize(t(10000000*signals) %*% w - turnover_lambda * turnover)
   
   # Constraints
   constraints <- list(
