@@ -13,7 +13,7 @@ print('---> Python Script Start', t0 := datetime.datetime.now())
 # %%
 
 print('---> initial data set up')
-nwankcqmeklngfop
+
 # instrument data
 df_bonds = pd.read_csv('data/data_bonds.csv')
 df_bonds['datestamp'] = pd.to_datetime(df_bonds['datestamp']).apply(lambda d: d.date())
@@ -55,6 +55,9 @@ n_days = 10
 prev_weights = [0.1]*10
 p_active_md = 1.2 # this can be set to your own limit, as long as the portfolio is capped at 1.5 on any given day
 weight_bounds = (0.0, 0.2)
+eps = 1e-9
+
+#print("Unique bond_code values:", sorted(df_bonds['bond_code'].unique()))
 
 for i in range(len(df_signals)):
 
@@ -73,10 +76,61 @@ for i in range(len(df_signals)):
     p_albi_md = df_train_albi['modified_duration'].tail(1)
 
     # feature engineering
-    df_train_macro['steepness'] = df_train_macro['us_10y'] - df_train_macro['us_2y'] 
-    df_train_bonds['md_per_conv'] = df_train_bonds.groupby(['bond_code'])['return'].transform(lambda x: x.rolling(window=n_days).mean()) * df_train_bonds['convexity'] / df_train_bonds['modified_duration']
-    df_train_bonds = df_train_bonds.merge(df_train_macro, how='left', on = 'datestamp')
-    df_train_bonds['signal'] = df_train_bonds['md_per_conv']*100 - df_train_bonds['top40_return']/10 + df_train_bonds['comdty_fut']/100
+    df_train_macro['jse_change'] = df_train_macro['top40_return'] # changing name
+    jse_yesterday = df_train_macro['jse_change'].iloc[-1] # single value for cjange, yesterday's value
+    df_train_macro['us_steepness'] = df_train_macro['us_10y'] - df_train_macro['us_2y'] 
+    df_train_macro['us_10yr_change'] = df_train_macro['us_10y'].diff()
+    df_train_macro['us_2yr_change'] = df_train_macro['us_2y'].diff()
+    df_train_macro['us_diff_steepness'] = df_train_macro['us_steepness'].diff()
+    # get single values we need
+    us_10yr_change_yesterday = df_train_macro['us_10yr_change'].iloc[-1]
+    us_slope_change_yesterday = df_train_macro['us_diff_steepness'].iloc[-1]
+
+    # consider commodity futures change
+    df_train_macro['comdty_chg'] = df_train_macro['comdty_fut'].pct_change()
+    comdty_change_yesterday = df_train_macro['comdty_chg'].iloc[-1]
+
+    # get yield momentum
+    df_train_bonds['yield_ma5']  = df_train_bonds.groupby('bond_code')['yield'].transform(lambda x: x.rolling(5).mean())
+    df_train_bonds['yield_ma20'] = df_train_bonds.groupby('bond_code')['yield'].transform(lambda x: x.rolling(20).mean())
+    df_train_bonds['yield_mom']  = df_train_bonds['yield_ma5'] - df_train_bonds['yield_ma20']
+
+    # get std dev
+    df_train_bonds['ret_vol_20'] = df_train_bonds.groupby('bond_code')['return'].transform(lambda x: x.rolling(20).std())
+
+    # get price shock
+    df_train_bonds['ret_shock'] = df_train_bonds.groupby('bond_code')['return'].transform(
+    lambda x: (x - x.rolling(20).mean()) / (x.rolling(20).std() + eps)
+    )
+
+    # get duration spike
+    #eps = 1e-9
+    df_train_bonds['md_spike'] = df_train_bonds.groupby('bond_code')['modified_duration'].transform(
+    lambda x: (x - x.rolling(20).mean()) / (x.rolling(20).std() + eps)
+    )
+
+    # convert all the above yield change indicators into one yield change
+    yhat_dy = (
+    -0.40 * jse_yesterday                # equities down → yields down → negative dy
+    + 0.30 * us_10yr_change_yesterday         # US10y up → SA yields up
+    + 0.15 * us_slope_change_yesterday       # steepening → yields up
+    + 0.10 * (0 if pd.isna(comdty_change_yesterday) else comdty_change_yesterday)  # commodities up → yields up
+    )
+
+    # now need to add this to traning data for bonds
+    df_train_bonds = df_train_bonds.merge(df_train_macro[['datestamp']], on='datestamp', how='left')  # already merged earlier in your code
+    df_train_bonds['signal'] = (
+    - df_train_bonds['modified_duration'] * yhat_dy
+    + 0.5 * df_train_bonds['convexity'] * (yhat_dy**2)   # optional convexity term
+    + 0.10 * (-df_train_bonds['yield_mom'])    # yields falling (neg mom) → bullish prices
+    - 0.05 * df_train_bonds['ret_vol_20']      # prefer stable bonds
+    - 0.05 * df_train_bonds['md_spike'].clip(lower=0)  # penalize positive duration spikes
+    )
+
+
+    #df_train_bonds['md_per_conv'] = df_train_bonds.groupby(['bond_code'])['return'].transform(lambda x: x.rolling(window=n_days).mean()) * df_train_bonds['convexity'] / df_train_bonds['modified_duration']
+    #df_train_bonds = df_train_bonds.merge(df_train_macro, how='left', on = 'datestamp')
+    #df_train_bonds['signal'] = df_train_bonds['md_per_conv']*100 - df_train_bonds['top40_return']/10 + df_train_bonds['comdty_fut']/100
     df_train_bonds_current = df_train_bonds[df_train_bonds['datestamp'] == df_train_bonds['datestamp'].max()]
     
     # optimisation objective
@@ -175,3 +229,5 @@ plot_md(weight_matrix)
 print('---> Python Script End', t1 := datetime.datetime.now())
 print('---> Total time taken', t1 - t0)
 
+
+# %%
