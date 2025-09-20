@@ -1,6 +1,6 @@
 # Load Packages ---- 
 
-install.packages("pacman")
+#install.packages("pacman")
 
 pacman::p_load(dplyr, readr, lubridate, slider, ggplot2, tidyr, zoo, CVXR, tictoc)
 
@@ -44,7 +44,7 @@ df_signals <- df_bonds %>%
 
 
 # parameters for optimisation - in this sample solution we use a momentum lookback strategy
-n_days <- 10
+n_days <- 2000
 prev_weights <- rep(0.1, 10)
 p_active_md <- 1.3 # this can be set to your own limit, as long as the portfolio is capped at 1.5 on any given day
 weight_bounds <- c(0.0, 0.2)
@@ -82,18 +82,55 @@ for(i in 1:nrow(df_signals)){
   
   p_albi_md <- df_train_albi$modified_duration %>% tail(1)
   
-  # feature engineering
+  # feature engineering - We want to update this
   df_train_macro <- 
     df_train_macro %>% 
     mutate(steepness = us_10y - us_2y)
+  
+  features <- c(
+    "convexity", "modified_duration", "yield", "md_per_conv",
+    "top40_return", "fx_vol", "us_2y", "us_10y", "us_20y",
+    "comdty_fut", "steepness"
+  )
+  
+  df_train_bonds <- df_train_bonds %>% mutate(signal = NA)
   
   df_train_bonds <- 
     df_train_bonds %>% 
     group_by(bond_code) %>% 
     mutate(md_per_conv = rollmeanr(return, n_days,na.pad = TRUE)*convexity/modified_duration) %>% 
-    left_join(df_train_macro, by = "datestamp") %>% 
-    mutate(signal = md_per_conv*100 - top40_return/10 + comdty_fut/100)
+    left_join(df_train_macro, by = "datestamp") %>%
+    mutate(target = lead(return)) %>%  # next day return
+    ungroup() %>%
+    select(all_of(features), target, datestamp, bond_code) %>%
+    na.omit()
   
+  dtrain <- xgb.DMatrix(data = as.matrix(df_train_bonds[, features]),
+                        label = df_train_bonds$target)
+  
+  # Create XG Boost model
+  if (i == 1)
+  {
+  xgb_model <- xgb.train(
+    params = list(
+      objective = "reg:squarederror",
+      eta = 0.05,
+      max_depth = 6,
+      subsample = 0.8,
+      colsample_bytree = 0.8,
+      eval_metric = "rmse"
+    ),
+    data = dtrain,
+    nrounds = 250,
+    verbose = 0
+  )
+  }
+  
+  # Predict signal for current date
+  dtest <- xgb.DMatrix(data = as.matrix(df_train_bonds %>% select(-c(target, datestamp, bond_code))))
+  df_train_bonds <- df_train_bonds %>% mutate(signal = NA)
+  df_train_bonds$signal <- predict(xgb_model, dtest)
+
   df_train_bonds_current <- 
     df_train_bonds %>% 
     filter(datestamp == max(datestamp)) %>% 
@@ -155,14 +192,14 @@ plot_payoff <- function(weight_matrix, df_bonds, df_albi) {
               port_md = sum(port_md, na.rm = TRUE), .groups = "drop") %>%
     left_join(df_albi[, c("datestamp", "return")], by = "datestamp") %>%
     rename(albi_return = return)
-
+  
   df_turnover <- weight_matrix %>%
     group_by(bond_code) %>%
     arrange(datestamp) %>%
     mutate(turnover = abs(weight - lag(weight))/2) %>%
     group_by(datestamp) %>%
     summarise(turnover = sum(turnover, na.rm = TRUE), .groups = "drop")
-
+  
   port_data <- port_data %>%
     left_join(df_turnover, by = "datestamp") %>%
     arrange(datestamp) %>%
@@ -172,25 +209,25 @@ plot_payoff <- function(weight_matrix, df_bonds, df_albi) {
       portfolio_tri = cumprod(1 + net_return / 100),
       albi_tri = cumprod(1 + albi_return / 100)
     )
-
+  
   tri_data <- port_data %>%
     select(datestamp, portfolio_tri, albi_tri) %>%
     pivot_longer(-datestamp, names_to = "type", values_to = "TRI")
-
+  
   print(ggplot(tri_data, aes(x = datestamp, y = TRI, color = type)) +
           geom_line(size = 1) +
           labs(title = "Portfolio vs ALBI TRI", x = "Date", y = "TRI") +
           theme_minimal())
-
+  
   print(ggplot(port_data, aes(x = datestamp, y = turnover)) +
           geom_line(color = "darkred", size = 1) +
           labs(title = "Daily Turnover", x = "Date", y = "Turnover") +
           theme_minimal())
-
+  
   print(ggplot(weight_matrix, aes(x = datestamp, y = weight, fill = bond_code))+ 
-    geom_area() +
-    labs(title = "Weights Through Time", x = "Date", y = "Weight") +
-    theme_minimal())
+          geom_area() +
+          labs(title = "Weights Through Time", x = "Date", y = "Weight") +
+          theme_minimal())
   
   cat(sprintf("---> payoff for these buys between %s and %s is %.2f%%\n",
               min(port_data$datestamp), max(port_data$datestamp),
@@ -207,12 +244,12 @@ plot_md <- function(weight_matrix, df_bonds, df_albi) {
     summarise(port_md = sum(port_md, na.rm = TRUE), .groups = "drop") %>%
     left_join(df_albi[, c("datestamp", "modified_duration")], by = "datestamp") %>%
     mutate(active_md = port_md - modified_duration)
-
+  
   print(ggplot(port_data, aes(x = datestamp, y = active_md)) +
           geom_line(color = "steelblue", size = 1) +
           labs(title = "Active Modified Duration", x = "Date", y = "Active MD") +
           theme_minimal())
-
+  
   breaches <- port_data %>% filter(abs(active_md) > 1.5)
   if (nrow(breaches) > 0) {
     stop(paste("This portfolio violates the duration constraint on:\n",
