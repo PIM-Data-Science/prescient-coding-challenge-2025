@@ -53,49 +53,70 @@ weight_matrix = pd.DataFrame()
 # static data for optimisation and signal generation
 n_days = 10
 prev_weights = [0.1]*10
-p_active_md = 1.2 # this can be set to your own limit, as long as the portfolio is capped at 1.5 on any given day
+p_active_md = 1.5  # Increased to max allowed for more allocation flexibility
 weight_bounds = (0.0, 0.2)
 
 for i in range(len(df_signals)):
 
-    print('---> doing', df_signals.loc[i, 'datestamp'])    
+    # EVOLVE-BLOCK-START
+    print('---> doing', df_signals.loc[i, 'datestamp'])
 
     # this iterations training set
     df_train_bonds = df_bonds[df_bonds['datestamp']<df_signals.loc[i, 'datestamp']].copy()
     df_train_albi = df_albi[df_albi['datestamp']<df_signals.loc[i, 'datestamp']].copy()
     df_train_macro = df_macro[df_macro['datestamp']<df_signals.loc[i, 'datestamp']].copy()
 
-    # this iterations test set
-    df_test_bonds = df_bonds[df_bonds['datestamp']>=df_signals.loc[i, 'datestamp']].copy()
-    df_test_albi = df_albi[df_albi['datestamp']>=df_signals.loc[i, 'datestamp']].copy()
-    df_test_macro = df_macro[df_macro['datestamp']>=df_signals.loc[i, 'datestamp']].copy()
-
-    p_albi_md = df_train_albi['modified_duration'].tail(1)
-
     # feature engineering
-    df_train_macro['steepness'] = df_train_macro['us_10y'] - df_train_macro['us_2y'] 
-    df_train_bonds['md_per_conv'] = df_train_bonds.groupby(['bond_code'])['return'].transform(lambda x: x.rolling(window=n_days).mean()) * df_train_bonds['convexity'] / df_train_bonds['modified_duration']
-    df_train_bonds = df_train_bonds.merge(df_train_macro, how='left', on = 'datestamp')
-    df_train_bonds['signal'] = df_train_bonds['md_per_conv']*100 - df_train_bonds['top40_return']/10 + df_train_bonds['comdty_fut']/100
-    df_train_bonds_current = df_train_bonds[df_train_bonds['datestamp'] == df_train_bonds['datestamp'].max()]
-    
-    # optimisation objective
+    current_albi_md = df_train_albi['modified_duration'].iloc[-1] if not df_train_albi.empty else 0.0
+
+    # Get last macro steepness (us_10y - us_2y); default 0 if NaN
+    last_macro = df_train_macro[df_train_macro['datestamp'] == df_train_macro['datestamp'].max()]
+    us_steep = (last_macro['us_10y'].iloc[0] - last_macro['us_2y'].iloc[0]) if not last_macro.empty else 0.0
+
+    # Blended carry (income + roll-down), 10d momentum, yield rel to 20d avg, macro steep adj, convexity
+    df_train_bonds['carry_income'] = df_train_bonds['yield'] / 252
+    df_train_bonds['carry_rolldown'] = df_train_bonds['yield'] * df_train_bonds['modified_duration'] / 252
+    df_train_bonds['carry'] = (df_train_bonds['carry_income'] + df_train_bonds['carry_rolldown']) / 2
+    df_train_bonds['momentum_10d'] = df_train_bonds.groupby('bond_code')['return'].transform(lambda x: x.rolling(10, min_periods=1).mean())
+    df_train_bonds['yield_rel_avg'] = df_train_bonds.groupby('bond_code')['yield'].transform(lambda x: x / x.rolling(20, min_periods=1).mean())
+
+    df_train_bonds_current = df_train_bonds[df_train_bonds['datestamp'] == df_train_bonds['datestamp'].max()].sort_values('bond_code').reset_index(drop=True).fillna(0)
+    df_train_bonds_current['macro_steep_adj'] = us_steep * df_train_bonds_current['modified_duration']
+
+    # Z-score normalize
+    for feat in ['carry', 'momentum_10d', 'yield_rel_avg', 'macro_steep_adj', 'convexity']:
+        mean_val = df_train_bonds_current[feat].mean()
+        std_val = df_train_bonds_current[feat].std()
+        df_train_bonds_current[feat + '_z'] = (df_train_bonds_current[feat] - mean_val) / std_val if std_val > 0 else 0
+
+    # Signal: carry (0.35), mom (0.25), rel (0.2), macro (0.1), convexity (0.1) for vol protection
+    df_train_bonds_current['signal'] = (
+        0.35 * df_train_bonds_current['carry_z'] +
+        0.25 * df_train_bonds_current['momentum_10d_z'] +
+        0.2 * df_train_bonds_current['yield_rel_avg_z'] +
+        0.1 * df_train_bonds_current['macro_steep_adj_z'] +
+        0.1 * df_train_bonds_current['convexity_z']
+    )
+
     def objective(weights, signal, prev_weights, turnover_lambda=0.1):
-        turnover = np.sum(np.abs(weights - prev_weights))
+        turnover = np.sum(np.abs(weights - prev_weights)) / 2
         return -(np.dot(weights, signal) - turnover_lambda * turnover)
-        
-    # Duration constraints
-    def duration_constraint(weights, durations_today):
+
+    def duration_constraint(weights, durations_today, albi_md, active_md_limit):
         port_duration = np.dot(weights, durations_today)
-        return [100*(port_duration - (p_albi_md - p_active_md)), 100*((p_albi_md + p_active_md) - port_duration)]
-    
-    # Optimization setup
-    turnover_lambda = 0.5
+        albi_md_scalar = albi_md.item() if isinstance(albi_md, pd.Series) else albi_md
+        return [
+            port_duration - (albi_md_scalar - active_md_limit),
+            (albi_md_scalar + active_md_limit) - port_duration
+        ]
+
+    # Optimization setup: Balanced lambda for signal-following with turnover control
+    turnover_lambda = 0.12
     bounds = [weight_bounds] * 10
     constraints = [
-        {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},  # weights sum to 1
-        {'type': 'ineq', 'fun': lambda w: duration_constraint(w, df_train_bonds_current['modified_duration'])[0]},
-        {'type': 'ineq', 'fun': lambda w: duration_constraint(w, df_train_bonds_current['modified_duration'])[1]}
+        {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},
+        {'type': 'ineq', 'fun': lambda w: duration_constraint(w, df_train_bonds_current['modified_duration'].values, current_albi_md, p_active_md)[0]},
+        {'type': 'ineq', 'fun': lambda w: duration_constraint(w, df_train_bonds_current['modified_duration'].values, current_albi_md, p_active_md)[1]}
     ]
 
     result = minimize(objective, prev_weights, args=(df_train_bonds_current['signal'], prev_weights, turnover_lambda), bounds=bounds, constraints=constraints)
